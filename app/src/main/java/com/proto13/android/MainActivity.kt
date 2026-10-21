@@ -46,6 +46,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.delay
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
@@ -300,6 +301,21 @@ private fun looksLikeTitle(line: String): Boolean {
         !lower.contains("\"")
 }
 
+internal data class ReferenceMatch(val title: String, val similarity: Double)
+
+internal fun bestReferenceMatch(candidate: String, knownTitles: Collection<String>): ReferenceMatch? {
+    val cleaned = normalizeTitleText(candidate)
+    if (cleaned.isBlank()) return null
+
+    return knownTitles.map { reference ->
+        val referenceNormalized = normalizeTitleText(reference)
+        val distance = levenshteinDistance(cleaned, referenceNormalized)
+        val maxLength = maxOf(cleaned.length, referenceNormalized.length)
+        val similarity = if (maxLength == 0) 1.0 else 1.0 - (distance.toDouble() / maxLength)
+        ReferenceMatch(reference, similarity)
+    }.maxByOrNull { it.similarity }
+}
+
 fun matchTitleToReference(candidate: String, knownTitles: Collection<String> = emptyList()): String {
     val cleaned = normalizeTitleText(candidate)
     if (cleaned.isBlank()) {
@@ -315,19 +331,11 @@ fun matchTitleToReference(candidate: String, knownTitles: Collection<String> = e
         return "Exact match: $exactMatch"
     }
 
-    val ranked = knownTitles.map { reference ->
-        val referenceNormalized = normalizeTitleText(reference)
-        val distance = levenshteinDistance(cleaned, referenceNormalized)
-        val maxLength = maxOf(cleaned.length, referenceNormalized.length)
-        val similarity = if (maxLength == 0) 1.0 else 1.0 - (distance.toDouble() / maxLength)
-        reference to similarity
-    }.sortedByDescending { it.second }
-
-    val bestMatch = ranked.firstOrNull()
-    return if ((bestMatch?.second ?: 0.0) >= 0.55) {
-        "Possible match: ${bestMatch!!.first}"
+    val bestMatch = bestReferenceMatch(candidate, knownTitles)
+    return if ((bestMatch?.similarity ?: 0.0) >= ControllerConfig.MIN_MATCH_CONFIDENCE) {
+        "Possible match: ${bestMatch!!.title}"
     } else {
-        "No strong match. Closest: ${bestMatch?.first ?: "unknown"}"
+        "No strong match. Closest: ${bestMatch?.title ?: "unknown"}"
     }
 }
 
@@ -444,8 +452,68 @@ fun Proto13App(modifier: Modifier = Modifier) {
     var capturePhoto: (Int, Int) -> Unit = { _, _ -> }
     var processImage: (Bitmap, Int, Int) -> Unit = { _, _, _ -> }
 
+    var activeJob by remember { mutableStateOf<IncomingMessage.Capture?>(null) }
+    var lastSuccess by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var controllerConnected by remember { mutableStateOf(false) }
+    var deviceState by remember { mutableStateOf(DeviceState.STARTING) }
+    val incomingHandler = remember { arrayOf<(IncomingMessage) -> Unit>({}) }
+    val link = remember {
+        ControllerLink(
+            onMessage = { incomingHandler[0](it) },
+            onConnectionChanged = { controllerConnected = it },
+            currentStatus = { statusPayload(deviceState, mode = activeJob?.mode) },
+        )
+    }
+    val cameraReady = hasCameraPermission && imageCapture != null
+
+    DisposableEffect(link) {
+        link.start()
+        onDispose { link.stop() }
+    }
+
+    LaunchedEffect(activeJob, cameraReady) {
+        deviceState = when {
+            activeJob != null -> DeviceState.BUSY
+            cameraReady -> DeviceState.READY
+            else -> DeviceState.DEGRADED
+        }
+        link.publishStatus()
+    }
+
+    LaunchedEffect(activeJob?.requestId) {
+        val job = activeJob ?: return@LaunchedEffect
+        while (true) {
+            delay(ControllerConfig.PROGRESS_INTERVAL_MS)
+            link.publish(
+                ControllerTopics.captureResult,
+                captureResultPayload(job.requestId, CaptureStatus.IN_PROGRESS, job.mode),
+            )
+        }
+    }
+
+    fun finishCapture(
+        status: CaptureStatus,
+        cardName: String? = null,
+        confidence: Double? = null,
+        error: String? = null,
+    ) {
+        val job = activeJob ?: return
+        val payload = captureResultPayload(job.requestId, status, job.mode, cardName, confidence, error)
+        if (status == CaptureStatus.SUCCESS) lastSuccess = job.requestId to payload
+        activeJob = null
+        link.publish(ControllerTopics.captureResult, payload)
+    }
+
+    fun rejectCapture(request: IncomingMessage.Capture, error: String) {
+        link.publish(
+            ControllerTopics.captureResult,
+            captureResultPayload(request.requestId, CaptureStatus.FAILURE, request.mode, error = error),
+        )
+    }
+
     capturePhoto = { attempt, maxAttempts ->
         if (!hasCameraPermission) {
+            finishCapture(CaptureStatus.FAILURE, error = "Camera permission is required.")
             cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
             hasCameraPermission = ContextCompat.checkSelfPermission(
                 context,
@@ -471,6 +539,7 @@ fun Proto13App(modifier: Modifier = Modifier) {
                                     capturePhoto(attempt + 1, maxAttempts)
                                 } else {
                                     errorMessage = "The captured image could not be decoded."
+                                    finishCapture(CaptureStatus.FAILURE, error = errorMessage)
                                 }
                             }
                         }
@@ -481,12 +550,58 @@ fun Proto13App(modifier: Modifier = Modifier) {
                             } else {
                                 errorMessage = exception.message ?: "Capture failed."
                                 isProcessing = false
+                                finishCapture(CaptureStatus.FAILURE, error = errorMessage)
                             }
                         }
                     }
                 )
             } else {
                 errorMessage = "Camera is not ready yet."
+                finishCapture(CaptureStatus.FAILURE, error = errorMessage)
+            }
+        }
+    }
+
+    incomingHandler[0] = { message ->
+        when (message) {
+            is IncomingMessage.StatusCheck -> {
+                link.publishStatus(
+                    statusPayload(deviceState, requestId = message.requestId, mode = activeJob?.mode)
+                )
+                if (message.diagnostics) {
+                    link.publish(
+                        ControllerTopics.status,
+                        diagnosticsPayload(
+                            message.requestId,
+                            listOf(
+                                DiagnosticCheck("camera_permission", hasCameraPermission),
+                                DiagnosticCheck("camera_ready", imageCapture != null),
+                                DiagnosticCheck(
+                                    "reference_cards",
+                                    loadCardNamesFromAsset(context).isNotEmpty()
+                                ),
+                            ),
+                        ),
+                    )
+                }
+            }
+            is IncomingMessage.Capture -> when {
+                activeJob?.requestId == message.requestId -> link.publish(
+                    ControllerTopics.captureResult,
+                    captureResultPayload(message.requestId, CaptureStatus.IN_PROGRESS, message.mode),
+                )
+                lastSuccess?.first == message.requestId ->
+                    link.publish(ControllerTopics.captureResult, lastSuccess!!.second)
+                activeJob != null -> rejectCapture(message, "busy with another capture")
+                !cameraReady -> rejectCapture(message, "camera not ready")
+                else -> {
+                    activeJob = message
+                    link.publish(
+                        ControllerTopics.captureResult,
+                        captureResultPayload(message.requestId, CaptureStatus.ACCEPTED, message.mode),
+                    )
+                    capturePhoto(0, ControllerConfig.MAX_CAPTURE_ATTEMPTS)
+                }
             }
         }
     }
@@ -517,6 +632,7 @@ fun Proto13App(modifier: Modifier = Modifier) {
                     titleMatch = "Exact match: $exactReferenceTitle"
                     footerSummary = "Exact card name matched in the local reference data."
                     isProcessing = false
+                    finishCapture(CaptureStatus.SUCCESS, exactReferenceTitle, 1.0)
                     return@addOnSuccessListener
                 }
 
@@ -527,10 +643,18 @@ fun Proto13App(modifier: Modifier = Modifier) {
                 }
 
                 val extraction = analyzeTitleExtraction(rawText)
+                val knownTitles = loadCardNamesFromAsset(context)
                 bestTitle = extraction.title
-                titleMatch = matchTitleToReference(extraction.title, loadCardNamesFromAsset(context))
+                titleMatch = matchTitleToReference(extraction.title, knownTitles)
                 footerSummary = extraction.footerSummary
                 isProcessing = false
+
+                val match = bestReferenceMatch(extraction.title, knownTitles)
+                if (match != null && match.similarity >= ControllerConfig.MIN_MATCH_CONFIDENCE) {
+                    finishCapture(CaptureStatus.SUCCESS, match.title, match.similarity)
+                } else {
+                    finishCapture(CaptureStatus.RETRY, confidence = match?.similarity, error = "no strong match")
+                }
             }
             .addOnFailureListener { exception ->
                 if (attempt < maxAttempts) {
@@ -538,6 +662,7 @@ fun Proto13App(modifier: Modifier = Modifier) {
                 } else {
                     errorMessage = exception.localizedMessage ?: "OCR failed."
                     isProcessing = false
+                    finishCapture(CaptureStatus.FAILURE, error = errorMessage)
                 }
             }
     }
@@ -561,6 +686,12 @@ fun Proto13App(modifier: Modifier = Modifier) {
             Text(
                 text = "Preview a card, capture the still, and OCR the result.",
                 style = MaterialTheme.typography.bodyLarge
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "Controller: ${if (controllerConnected) "connected" else "offline"} · " +
+                    "${deviceState.wire}" + (activeJob?.let { " · request ${it.requestId}" } ?: ""),
+                style = MaterialTheme.typography.bodyMedium
             )
             Spacer(modifier = Modifier.height(16.dp))
 
